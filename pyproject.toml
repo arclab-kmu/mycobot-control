@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mycobot-control"
+version = "0.1.0"
+description = "Keyboard joint / Cartesian control, recording and safety interlocks for the Elephant Robotics myCobot 280 (JetsonNano). ROS 2 is optional."
+readme = "README.md"
+# 3.8, not nero-control's 3.10: this package is meant to run ON the Jetson as
+# well as on a PC, and the Jetson images ship an older Python. Hence
+# `from __future__ import annotations` everywhere and typing.List / Optional
+# wherever a type is evaluated at runtime.
+# TODO(unverified): the Python version on this lab's Jetson has not been read.
+requires-python = ">=3.8"
+authors = [{ name = "Hojin Kim" }]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering",
+]
+
+# Core dependencies: none. Dry-run teleop, the interlocks, the keymap and the
+# recorder's file format are all pure Python, so a plain install works offline
+# and on the Jetson without compiling anything. The rotation math in
+# teleop/keymap.py is written out by hand for the same reason.
+dependencies = []
+
+[project.optional-dependencies]
+# Real hardware. pymycobot IS on PyPI (unlike nero-control's pyAgxArm), and it
+# stays an extra anyway: the hardware-touching import must not be on the
+# default path. >=4.0.5 matches mycobot_ros2/requirements.txt; MyCobot280 (the
+# class the vendor's JN scripts use) needs >=4.0.0. <5 because every signature
+# in sdk/backend.py was read from 4.0.7.
+arm = ["pymycobot>=4.0.5,<5"]
+
+# Intentionally empty, as in nero-control: rclpy comes from a sourced ROS 2
+# environment (see ~/manipulation/mycobot_ros2), not from PyPI.
+ros = []
+
+dev = ["pytest>=7"]
+
+[project.scripts]
+mycobot = "mycobot_control.cli:main"
+mycobot-teleop-keyboard = "mycobot_control.teleop.keyboard:main"
+mycobot-info = "mycobot_control.sdk.info:main"
+mycobot-move-joints = "mycobot_control.sdk.jointmove:main"
+mycobot-record = "mycobot_control.record.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mycobot_control"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "docs", "README.md", "LICENSE", "AGENTS.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

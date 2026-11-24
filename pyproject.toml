@@ -38,7 +38,11 @@ arm = ["pymycobot>=4.0.5,<5"]
 # environment (see ~/manipulation/mycobot_ros2), not from PyPI.
 ros = []
 
-dev = ["pytest>=7"]
+# mycobot-qp, teleop --ik qp and the mycobot_control.qp package (QP IK,
+# chunk streaming). numpy only; >=1.17 because the Jetson image ships 1.19.
+qp = ["numpy>=1.17"]
+
+dev = ["pytest>=7", "numpy>=1.17"]
 
 [project.scripts]
 mycobot = "mycobot_control.cli:main"
@@ -46,6 +50,7 @@ mycobot-teleop-keyboard = "mycobot_control.teleop.keyboard:main"
 mycobot-info = "mycobot_control.sdk.info:main"
 mycobot-move-joints = "mycobot_control.sdk.jointmove:main"
 mycobot-record = "mycobot_control.record.cli:main"
+mycobot-qp = "mycobot_control.qp.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mycobot_control"]

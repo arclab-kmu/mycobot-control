@@ -8,6 +8,12 @@ opens the gate), read the MEASURED state, add one step, command it. Targets are
 never accumulated open-loop - a delta stacked on a pose the arm never reached
 compounds error.
 
+Cartesian mode has two IK paths. ``--ik qp`` (the CLI default): a key becomes
+a short min-jerk chunk that the QP controller (``mycobot_control.qp``) streams
+as joint commands through ``command_joints`` every tick, starting from the
+measured joints when idle and from the commanded pose while a chunk runs.
+``--ik firmware``: one ``send_coords`` per key; the firmware solves the IK.
+
 Run it in the foreground of a real TTY; it reads single keys in cbreak mode.
 """
 
@@ -19,7 +25,7 @@ import os
 import select
 import sys
 import time
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 try:  # POSIX only.
     import termios
@@ -137,10 +143,22 @@ def run(
     status_settle_s: float = 0.3,
     out=None,
     eventlog: Optional[EventLog] = None,
+    ik: str = "firmware",
+    qp_rate_hz: float = 20.0,
+    qp_lookahead_ticks: int = 2,
+    clock: Callable[[], float] = time.monotonic,
 ) -> int:
-    """The teleop loop. Returns a process exit code."""
+    """The teleop loop. Returns a process exit code.
+
+    ``ik`` only matters in cartesian mode: ``"firmware"`` (``send_coords``) or
+    ``"qp"`` (joint commands from :mod:`mycobot_control.qp` at ``qp_rate_hz``;
+    ``clock`` times those ticks). The library default stays ``"firmware"``;
+    the CLI defaults to ``qp``.
+    """
     out = out if out is not None else sys.stdout
     bindings = bindings_for(mode)
+    if ik not in ("firmware", "qp"):
+        raise ValueError(f"ik must be 'firmware' or 'qp', got {ik!r}")
     deadman = Deadman(session.gate, timeout_s=deadman_timeout_s)
     halted_by: Optional[str] = None
 
@@ -151,10 +169,25 @@ def run(
         if eventlog is not None:
             eventlog.record(event, gate=session.gate.is_open, latched=halted_by is not None, **fields)
 
+    jog = None
+    tracking_error: type = RuntimeError
+    if mode == "cartesian" and ik == "qp":
+        # numpy lives behind the `qp` extra; joint mode and --ik firmware must
+        # keep working without it, so import only here.
+        try:
+            from mycobot_control.qp.chunk import TrackingError
+            from mycobot_control.qp.jog import QPJog
+        except ImportError as exc:
+            say(f"--ik qp needs numpy (install the qp extra), or use --ik firmware: {exc}")
+            return 2
+        jog = QPJog(rate_hz=qp_rate_hz, lookahead_ticks=qp_lookahead_ticks)
+        tracking_error = TrackingError
+
     say(f"backend: {session.backend.describe()}")
     if session.config.read_only:
         say("         commands are computed and logged, never transmitted")
-    say(f"mode   : {mode}   speed {session.config.speed}")
+    ik_note = f"   ik {ik}" + (f" @ {qp_rate_hz:.0f} Hz" if jog is not None else "") if mode == "cartesian" else ""
+    say(f"mode   : {mode}{ik_note}   speed {session.config.speed}")
     say(f"deadman: {deadman_timeout_s:.2f} s of silence closes the control gate")
     if eventlog is not None:
         say(f"log    : {eventlog.csv_path}")
@@ -164,7 +197,7 @@ def run(
 
     try:
         joints = session.read_joints()
-        coords = session.read_coords() if mode == "cartesian" else None
+        coords = session.read_coords() if mode == "cartesian" and jog is None else None
     except SessionError as exc:
         say(f"cannot read the starting state: {exc}")
         note("end", note=str(exc))
@@ -172,6 +205,8 @@ def run(
     say(f"start  : joints {_fmt(joints.angles, ' deg')}")
     if coords is not None:
         say(f"         coords {_fmt(coords.coords)}")
+    if jog is not None:
+        say(f"         tcp    {_fmt(jog.kin.xyzrpy(joints.angles))} (QP kinematics)")
     note("start", measured=joints.angles, note=session.backend.describe())
 
     gripper_value: Optional[int] = None
@@ -199,8 +234,39 @@ def run(
         note("latch_clear", note=status.describe())
         return False
 
+    next_tick = clock()
+
+    def qp_tick() -> None:
+        """One QP tick: read, check tracking, command. Any problem drops the chunk."""
+        nonlocal next_tick
+        assert jog is not None
+        next_tick = max(next_tick + jog.dt, clock())
+        if halted_by is not None or not session.gate.is_open:
+            jog.cancel()  # the deadman, a stop or a latch closed the gate: the arm holds its last target
+            return
+        try:
+            reading = session.read_joints()
+            target = jog.tick(reading.angles)
+            session.command_joints(target, measured=reading)
+        except GateClosed:
+            jog.cancel()
+        except (tracking_error, LimitViolation) as exc:
+            jog.cancel()
+            deadman.release("qp stream refused")
+            session.halt("qp stream refused")
+            say(f"  ! qp stream stopped, stop() sent: {exc}")
+            note("qp", outcome="halt", note=str(exc))
+        except SessionError as exc:
+            jog.cancel()
+            deadman.release("feedback lost")
+            say(f"  ! qp stream stopped: {exc}")
+            note("qp", outcome="refused_feedback", note=str(exc))
+
     while True:
-        key = reader.read(poll_interval_s)
+        timeout = poll_interval_s
+        if jog is not None and jog.active:
+            timeout = max(0.0, min(poll_interval_s, next_tick - clock()))
+        key = reader.read(timeout)
 
         if status_due_at is not None and time.monotonic() >= status_due_at:
             status_due_at = None
@@ -216,6 +282,9 @@ def run(
                     outcome = "rejected" if status.was_rejected else "abnormal"
                 note("status", outcome=outcome, note=status.describe())
 
+        if jog is not None and jog.active and clock() >= next_tick:
+            qp_tick()
+
         if key is None:
             was_open = session.gate.is_open
             if deadman.check() and was_open:
@@ -230,6 +299,8 @@ def run(
             return 0
 
         if key == " ":
+            if jog is not None:
+                jog.cancel()
             deadman.release("stop key")
             session.halt("stop key")
             say("stop: gate closed, stop() sent")
@@ -296,6 +367,16 @@ def run(
                 measured = reading.angles
                 target = apply_joint_key(measured, binding, joint_step_deg)
                 session.command_joints(target, measured=reading)
+            elif jog is not None:
+                reading = session.read_joints()
+                measured = reading.angles
+                start = jog.start_coords(measured)
+                target = apply_cartesian_key(start, binding, linear_step_mm, angular_step_deg, rotation_frame)
+                jog.goal(target)
+                next_tick = clock()
+                qp_tick()  # first command now, not one tick later
+                if not jog.active:
+                    continue  # qp_tick refused and said why
             else:
                 creading = session.read_coords()
                 measured = creading.coords
@@ -315,7 +396,7 @@ def run(
             note("key", key=key, action=binding.label, outcome="refused_feedback", note=str(exc))
             continue
 
-        say(f"{binding.label:<5} -> {_fmt(target)}")
+        say(f"{binding.label:<5} -> {_fmt(target)}" + (" (qp)" if jog is not None else ""))
         note("key", key=key, action=binding.label, outcome="commanded", measured=measured, target=target)
         # send_* is fire-and-forget (_async=True), so an IK rejection or a limit
         # error only shows up in a later get_error_information(). Read it on a
@@ -329,14 +410,18 @@ def build_parser() -> argparse.ArgumentParser:
         description="Keyboard joint / Cartesian teleop for the myCobot 280. Dry-run unless --live.",
     )
     parser.add_argument("--mode", choices=("joint", "cartesian"), default="joint",
-                        help="joint: one key pair per joint (default). cartesian: firmware IK via send_coords.")
+                        help="joint: one key pair per joint (default). cartesian: TCP steps, IK per --ik.")
+    parser.add_argument("--ik", choices=("qp", "firmware"), default="qp",
+                        help="cartesian IK. qp (default): QP controller streams joint commands (needs the qp "
+                             "extra). firmware: send_coords, the firmware solves the IK.")
+    parser.add_argument("--qp-rate", type=float, default=20.0, help="QP command rate in Hz (default 20)")
     parser.add_argument("--joint-step", type=float, default=DEFAULT_JOINT_STEP_DEG, help="deg per key")
     parser.add_argument("--linear-step", type=float, default=DEFAULT_LINEAR_STEP_MM, help="mm per key")
     parser.add_argument("--angular-step", type=float, default=DEFAULT_ANGULAR_STEP_DEG, help="deg per key")
     parser.add_argument("--gripper-step", type=int, default=DEFAULT_GRIPPER_STEP, help="gripper units per key")
     parser.add_argument("--rotation-frame", choices=("base", "tool"), default="base")
     parser.add_argument("--coords-mode", type=int, choices=(0, 1), default=0,
-                        help="send_coords mode: 0 joint-interpolated (default), 1 straight line")
+                        help="--ik firmware only. send_coords mode: 0 joint-interpolated (default), 1 straight line")
     parser.add_argument("--deadman", type=float, default=DEFAULT_DEADMAN_TIMEOUT_S, help="seconds")
     parser.add_argument("--log", nargs="?", const="auto", default=None,
                         help="write a per-keypress CSV (default path: recordings/teleop-*.csv)")
@@ -359,7 +444,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if problem:
         print(problem, file=sys.stderr)
         return 2
-    if not confirm_live(config, f"keyboard teleop ({args.mode} mode)", args.assume_yes):
+    if args.qp_rate <= 0:
+        print("--qp-rate must be positive", file=sys.stderr)
+        return 2
+    what = f"{args.mode} mode" + (f", ik {args.ik}" if args.mode == "cartesian" else "")
+    if not confirm_live(config, f"keyboard teleop ({what})", args.assume_yes):
         return 1
     eventlog = None
     if args.log:
@@ -372,6 +461,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 angular_step_deg=args.angular_step, gripper_step=args.gripper_step,
                 rotation_frame=args.rotation_frame, coords_mode=args.coords_mode,
                 deadman_timeout_s=args.deadman, eventlog=eventlog,
+                ik=args.ik, qp_rate_hz=args.qp_rate,
             )
     except (SessionError, RuntimeError, ImportError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -46,10 +46,19 @@ def test_pymycobot_only_imported_inside_functions():
 def test_importing_everything_loads_neither_ros_nor_pymycobot():
     # A subprocess, not sys.modules surgery: clearing modules in-process breaks
     # class identity for the other tests (nero-control learned this).
+    # mycobot_control.qp is the numpy package (the `qp` extra) and is skipped
+    # here; tests/test_qp_imports.py holds it to its own rules. A hand-rolled
+    # walk, because pkgutil.walk_packages imports every package it descends into.
     code = (
         "import sys, pkgutil, importlib, mycobot_control\n"
-        "for m in pkgutil.walk_packages(mycobot_control.__path__, 'mycobot_control.'):\n"
-        "    importlib.import_module(m.name)\n"
+        "def walk(path, prefix):\n"
+        "    for m in pkgutil.iter_modules(path, prefix):\n"
+        "        if m.name == 'mycobot_control.qp':\n"
+        "            continue\n"
+        "        mod = importlib.import_module(m.name)\n"
+        "        if m.ispkg:\n"
+        "            walk(mod.__path__, m.name + '.')\n"
+        "walk(mycobot_control.__path__, 'mycobot_control.')\n"
         "bad = sorted(n for n in sys.modules if n.split('.')[0] in "
         "{'rclpy', 'pymycobot', 'serial', 'numpy'})\n"
         "print(','.join(bad))\n"

@@ -38,6 +38,11 @@ arm = ["pymycobot>=4.0.5,<5"]
 # environment (see ~/manipulation/mycobot_ros2), not from PyPI.
 ros = []
 
+# mycobot-camera. Headless: the viewer is a browser page, and the GUI build
+# pulls in Qt. TODO(unverified): on the Jetson, JetPack's system OpenCV (with
+# GStreamer, for CSI cameras) may be the one to use instead of this wheel.
+camera = ["opencv-python-headless>=4.5"]
+
 # mycobot-qp, teleop --ik qp and the mycobot_control.qp package (QP IK,
 # chunk streaming). numpy only; >=1.17 because the Jetson image ships 1.19.
 qp = ["numpy>=1.17"]
@@ -51,6 +56,7 @@ mycobot-info = "mycobot_control.sdk.info:main"
 mycobot-move-joints = "mycobot_control.sdk.jointmove:main"
 mycobot-record = "mycobot_control.record.cli:main"
 mycobot-qp = "mycobot_control.qp.cli:main"
+mycobot-camera = "mycobot_control.camera.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mycobot_control"]

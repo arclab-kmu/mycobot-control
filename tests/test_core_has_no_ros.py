@@ -1,4 +1,4 @@
-"""Invariant 1: nothing on the core import path imports ROS or pymycobot."""
+"""Invariant 1: nothing on the core import path imports ROS or pymycobot (nor OpenCV)."""
 
 import ast
 import subprocess
@@ -60,7 +60,7 @@ def test_importing_everything_loads_neither_ros_nor_pymycobot():
         "            walk(mod.__path__, m.name + '.')\n"
         "walk(mycobot_control.__path__, 'mycobot_control.')\n"
         "bad = sorted(n for n in sys.modules if n.split('.')[0] in "
-        "{'rclpy', 'pymycobot', 'serial', 'numpy'})\n"
+        "{'rclpy', 'pymycobot', 'serial', 'numpy', 'cv2'})\n"
         "print(','.join(bad))\n"
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
